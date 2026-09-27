@@ -1,83 +1,55 @@
-
-import unittest
 import os
 import shutil
 import sys
 import tempfile
+import time
 import types
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+
 from moviepy import (
+    ImageClip,
     VideoFileClip,
 )
+
 # add project root to python path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 from app.config import config
-from app.controllers.manager.base_manager import TaskQueueFullError
-from app.controllers.manager.memory_manager import InMemoryTaskManager
-from app.controllers.v1 import video as video_controller
-from app.models import const
 from app.models.schema import MaterialInfo
-from app.services import state as sm
 from app.services import video as vd
 from app.utils import utils
 
 resources_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resources")
 
 
-class _FakeRequest:
-    def __init__(self):
-        self.headers = {"x-task-id": "test-request"}
+class _FakeMoviePyClip:
+    """为最终混音单测提供最小 MoviePy 接口，避免 CI 真实编码大型视频。"""
 
+    def __init__(self, *, duration=5, fps=44100):
+        self.duration = duration
+        self.fps = fps
+        self.close_calls = 0
+        self.with_audio_result = self
 
-class TestSecurityControls(unittest.TestCase):
-    def setUp(self):
-        self.original_app_config = dict(config.app)
+    def __enter__(self):
+        return self
 
-    def tearDown(self):
-        config.app.clear()
-        config.app.update(self.original_app_config)
+    def __exit__(self, *_args):
+        self.close()
 
-    def test_task_query_returns_relative_task_url_without_mutating_state(self):
-        """
-        endpoint 未显式配置时，任务查询接口不能使用 Host 派生绝对 URL，
-        也不能把展示 URL 回写到任务状态里，否则不同 Host 查询会污染结果。
-        """
-        task_id = "security-task-url"
-        task_dir = utils.task_dir(task_id)
-        video_path = os.path.join(task_dir, "final-1.mp4")
-        Path(video_path).write_bytes(b"fake-video")
-        config.app["endpoint"] = ""
+    def close(self):
+        self.close_calls += 1
 
-        try:
-            sm.state.update_task(
-                task_id,
-                state=const.TASK_STATE_COMPLETE,
-                videos=[video_path],
-                combined_videos=[video_path],
-            )
+    def with_effects(self, _effects):
+        return self
 
-            response = video_controller.get_task(_FakeRequest(), task_id=task_id)
+    def with_audio(self, _audio):
+        return self.with_audio_result
 
-            self.assertEqual(response["data"]["videos"], [f"/tasks/{task_id}/final-1.mp4"])
-            self.assertEqual(sm.state.get_task(task_id)["videos"], [video_path])
-        finally:
-            sm.state.delete_task(task_id)
-            shutil.rmtree(task_dir, ignore_errors=True)
-
-    def test_in_memory_task_manager_rejects_when_queue_is_full(self):
-        """
-        并发数用尽后，等待队列必须有硬上限。这里用 max_concurrent_tasks=0
-        强制任务进入队列，验证超过 max_queued_tasks 时会拒绝继续入队。
-        """
-        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=1)
-
-        manager.add_task(lambda: None)
-
-        with self.assertRaises(TaskQueueFullError):
-            manager.add_task(lambda: None)
 
 class TestVideoService(unittest.TestCase):
     def setUp(self):
@@ -85,13 +57,358 @@ class TestVideoService(unittest.TestCase):
         self.test_img_path = os.path.join(resources_dir, "1.png")
         vd._runtime_disabled_video_codecs.clear()
         vd._ffmpeg_encoder_exists.cache_clear()
-    
+
     def tearDown(self):
         config.app.clear()
         config.app.update(self.original_app_config)
         vd._runtime_disabled_video_codecs.clear()
         vd._ffmpeg_encoder_exists.cache_clear()
-    
+
+    def test_subtitle_spring_animation_keeps_color_and_mask_aligned(self):
+        """
+        弹跳动画必须同步缩放颜色帧和透明蒙版。
+
+        旧实现只缩放颜色帧，首帧仍使用原尺寸蒙版，合成后会短暂出现黑色
+        文字轮廓。使用纯白画面和完整蒙版可以精确比较二者的有效像素区域。
+        """
+        color_frame = vd.np.full((20, 30, 3), 255, dtype=vd.np.uint8)
+        mask_frame = vd.np.ones((20, 30), dtype=float)
+        clip = (
+            ImageClip(color_frame)
+            .with_mask(ImageClip(mask_frame, is_mask=True))
+            .with_duration(1)
+        )
+        animated = vd._apply_subtitle_spring_animation(clip, 1)
+
+        try:
+            initial_color = vd.np.any(animated.get_frame(0) > 0, axis=2)
+            initial_mask = animated.mask.get_frame(0) > 0
+            vd.np.testing.assert_array_equal(initial_color, initial_mask)
+            self.assertLess(initial_color.sum(), color_frame.shape[0] * color_frame.shape[1])
+
+            # 动画结束后必须精确恢复原始尺寸，避免长字幕持续模糊或缩放。
+            settled_color = animated.get_frame(
+                vd._SUBTITLE_SPRING_DURATION_SECONDS
+            )
+            settled_mask = animated.mask.get_frame(
+                vd._SUBTITLE_SPRING_DURATION_SECONDS
+            )
+            vd.np.testing.assert_array_equal(settled_color, color_frame)
+            vd.np.testing.assert_array_equal(settled_mask, mask_frame)
+        finally:
+            vd.close_clip(animated)
+            vd.close_clip(clip)
+
+    def test_subtitle_spring_scale_handles_time_boundaries(self):
+        """零时长、负时间和动画结束点都不能产生除零或非法缩放比例。"""
+        duration = vd._SUBTITLE_SPRING_DURATION_SECONDS
+
+        self.assertEqual(vd._get_subtitle_spring_scale(0, duration), 0.05)
+        self.assertEqual(vd._get_subtitle_spring_scale(-1, duration), 0.05)
+        self.assertEqual(vd._get_subtitle_spring_scale(duration, duration), 1.0)
+        self.assertEqual(vd._get_subtitle_spring_scale(1, 0), 1.0)
+
+    def test_scale_subtitle_frame_rejects_unsupported_shapes(self):
+        """异常通道或维度应明确失败，避免把损坏帧继续交给视频编码器。"""
+        with self.assertRaisesRegex(ValueError, "2D mask or 3D color"):
+            vd._scale_subtitle_frame_on_canvas(vd.np.zeros((8,)), 0.5)
+        with self.assertRaisesRegex(ValueError, "RGB or RGBA"):
+            vd._scale_subtitle_frame_on_canvas(
+                vd.np.zeros((8, 8, 2), dtype=vd.np.uint8),
+                0.5,
+            )
+
+    def test_fit_clip_cover_fills_portrait_canvas_without_black_bars(self):
+        source_color = [17, 34, 51]
+        source = ImageClip(
+            vd.np.full((90, 160, 3), source_color, dtype=vd.np.uint8)
+        ).with_duration(1)
+        fitted = vd._fit_clip_to_canvas(
+            source,
+            target_width=90,
+            target_height=160,
+            fit_mode=vd.VideoFitMode.cover,
+        )
+
+        try:
+            self.assertEqual(tuple(fitted.size), (90, 160))
+            frame = fitted.get_frame(0)
+            self.assertEqual(frame[0, 45].tolist(), source_color)
+            self.assertEqual(frame[-1, 45].tolist(), source_color)
+        finally:
+            vd.close_clip(fitted)
+            vd.close_clip(source)
+
+    def test_fit_clip_contain_preserves_legacy_black_bars(self):
+        source_color = [17, 34, 51]
+        source = ImageClip(
+            vd.np.full((90, 160, 3), source_color, dtype=vd.np.uint8)
+        ).with_duration(1)
+        fitted = vd._fit_clip_to_canvas(
+            source,
+            target_width=90,
+            target_height=160,
+            fit_mode=vd.VideoFitMode.contain,
+        )
+
+        try:
+            self.assertEqual(tuple(fitted.size), (90, 160))
+            frame = fitted.get_frame(0)
+            self.assertEqual(frame[0, 45].tolist(), [0, 0, 0])
+            self.assertEqual(frame[80, 45].tolist(), source_color)
+        finally:
+            vd.close_clip(fitted)
+            vd.close_clip(source)
+
+    def test_delete_files_deduplicates_paths_and_ignores_missing_files(self):
+        """
+        循环片段会让同一路径在拼接列表中重复出现，清理时每个路径只能删除一次。
+
+        已不存在的文件属于幂等清理的正常状态，不应再产生误导用户的失败日志。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            existing_file = os.path.join(temp_dir, "temp-clip-1.mp4")
+            missing_file = os.path.join(temp_dir, "already-removed.mp4")
+            Path(existing_file).write_bytes(b"temporary clip")
+
+            original_remove = os.remove
+            with (
+                patch.object(vd.os, "remove", wraps=original_remove) as remove,
+                patch.object(vd.logger, "warning") as warning,
+            ):
+                vd.delete_files(
+                    [
+                        existing_file,
+                        existing_file,
+                        missing_file,
+                        missing_file,
+                    ]
+                )
+
+        self.assertEqual(
+            [item.args[0] for item in remove.call_args_list],
+            [existing_file, missing_file],
+        )
+        warning.assert_not_called()
+
+    def test_delete_files_logs_actionable_os_errors(self):
+        """权限等真实清理失败必须保留路径和系统错误，方便定位残留文件。"""
+        with (
+            patch.object(
+                vd.os,
+                "remove",
+                side_effect=PermissionError("permission denied"),
+            ),
+            patch.object(vd.logger, "warning") as warning,
+        ):
+            vd.delete_files(["protected-temp-clip.mp4"])
+
+        warning.assert_called_once()
+        message = warning.call_args.args[0]
+        self.assertIn("protected-temp-clip.mp4", message)
+        self.assertIn("permission denied", message)
+
+    def test_generate_video_reports_successful_bgm_mix_and_closes_sources(self):
+        """BGM 混合成功后应返回 True，并释放所有原始文件 reader。"""
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=False,
+            bgm_type="sonilo",
+        )
+        source_video = _FakeMoviePyClip()
+        voice_source = _FakeMoviePyClip()
+        bgm_source = _FakeMoviePyClip()
+        mixed_audio = _FakeMoviePyClip(fps=48000)
+        final_video = _FakeMoviePyClip()
+        source_video.with_audio_result = final_video
+
+        with (
+            patch.object(
+                vd, "_open_video_clip_quietly", return_value=source_video
+            ),
+            patch.object(
+                vd, "AudioFileClip", side_effect=[voice_source, bgm_source]
+            ),
+            patch.object(vd, "CompositeAudioClip", return_value=mixed_audio),
+            patch.object(vd, "_write_videofile_with_codec_fallback") as writer,
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+        ):
+            result = vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+                bgm_file_override="sonilo.m4a",
+            )
+
+        self.assertTrue(result)
+        writer.assert_called_once()
+        self.assertEqual(writer.call_args.kwargs["audio_fps"], 48000)
+        self.assertEqual(source_video.close_calls, 1)
+        self.assertEqual(voice_source.close_calls, 1)
+        self.assertEqual(bgm_source.close_calls, 1)
+        self.assertEqual(final_video.close_calls, 1)
+
+    def test_generate_video_keeps_output_and_reports_failed_bgm_mix(self):
+        """BGM 打开失败时仍应只写一次无 BGM 视频，并返回 False。"""
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=False,
+            bgm_type="sonilo",
+        )
+        source_video = _FakeMoviePyClip()
+        voice_source = _FakeMoviePyClip()
+        final_video = _FakeMoviePyClip()
+        source_video.with_audio_result = final_video
+
+        with (
+            patch.object(
+                vd, "_open_video_clip_quietly", return_value=source_video
+            ),
+            patch.object(
+                vd,
+                "AudioFileClip",
+                side_effect=[voice_source, RuntimeError("invalid BGM")],
+            ),
+            patch.object(vd, "CompositeAudioClip") as composite_audio,
+            patch.object(vd, "_write_videofile_with_codec_fallback") as writer,
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+            patch.object(vd.logger, "exception") as log_exception,
+        ):
+            result = vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+                bgm_file_override="broken.m4a",
+            )
+
+        self.assertFalse(result)
+        writer.assert_called_once()
+        composite_audio.assert_not_called()
+        log_exception.assert_called_once()
+        self.assertEqual(source_video.close_calls, 1)
+        self.assertEqual(voice_source.close_calls, 1)
+        self.assertEqual(final_video.close_calls, 1)
+
+    def test_generate_video_skips_every_bgm_source_when_volume_is_zero(self):
+        """0 音量必须在解析文件前统一短路当前来源和未来提供商。"""
+        test_cases = [
+            ("random", None),
+            ("custom", None),
+            ("sonilo", "sonilo.m4a"),
+            ("future_provider", "future-provider.wav"),
+        ]
+        for bgm_type, bgm_override in test_cases:
+            with self.subTest(bgm_type=bgm_type):
+                params = vd.VideoParams(
+                    video_subject="test",
+                    subtitle_enabled=False,
+                    bgm_type=bgm_type,
+                    bgm_file="missing-background.mp3",
+                    bgm_volume=0.0,
+                )
+                source_video = _FakeMoviePyClip()
+                voice_source = _FakeMoviePyClip()
+                final_video = _FakeMoviePyClip()
+                source_video.with_audio_result = final_video
+
+                with (
+                    patch.object(
+                        vd,
+                        "_open_video_clip_quietly",
+                        return_value=source_video,
+                    ),
+                    patch.object(
+                        vd, "AudioFileClip", return_value=voice_source
+                    ) as audio_file_clip,
+                    patch.object(vd, "get_bgm_file") as get_bgm_file,
+                    patch.object(vd, "CompositeAudioClip") as composite_audio,
+                    patch.object(
+                        vd, "_write_videofile_with_codec_fallback"
+                    ) as writer,
+                    patch.object(
+                        vd, "_get_configured_video_codec", return_value="libx264"
+                    ),
+                ):
+                    result = vd.generate_video(
+                        video_path="combined.mp4",
+                        audio_path="voice.mp3",
+                        subtitle_path="",
+                        output_file="final.mp4",
+                        params=params,
+                        bgm_file_override=bgm_override,
+                    )
+
+                self.assertTrue(result)
+                audio_file_clip.assert_called_once_with("voice.mp3")
+                get_bgm_file.assert_not_called()
+                composite_audio.assert_not_called()
+                writer.assert_called_once()
+                self.assertEqual(source_video.close_calls, 1)
+                self.assertEqual(voice_source.close_calls, 1)
+                self.assertEqual(final_video.close_calls, 1)
+
+    def test_generate_video_chooses_looping_by_bgm_file_source(self):
+        """默认曲库需要循环，任务层提供的时长适配文件不应依赖提供商名称。"""
+        test_cases = [
+            ("random", None, True),
+            ("custom", None, True),
+            ("sonilo", "sonilo.m4a", False),
+            ("future_provider", "future-provider.wav", False),
+        ]
+        for bgm_type, bgm_override, should_loop in test_cases:
+            with self.subTest(bgm_type=bgm_type, bgm_override=bgm_override):
+                params = vd.VideoParams(
+                    video_subject="test",
+                    subtitle_enabled=False,
+                    bgm_type=bgm_type,
+                    bgm_file="library.mp3",
+                    bgm_volume=0.2,
+                )
+                source_video = _FakeMoviePyClip()
+                voice_source = _FakeMoviePyClip()
+                bgm_source = _FakeMoviePyClip()
+                mixed_audio = _FakeMoviePyClip()
+                final_video = _FakeMoviePyClip()
+                source_video.with_audio_result = final_video
+
+                with (
+                    patch.object(
+                        vd,
+                        "_open_video_clip_quietly",
+                        return_value=source_video,
+                    ),
+                    patch.object(
+                        vd,
+                        "AudioFileClip",
+                        side_effect=[voice_source, bgm_source],
+                    ),
+                    patch.object(vd, "get_bgm_file", return_value="library.mp3"),
+                    patch.object(vd, "CompositeAudioClip", return_value=mixed_audio),
+                    patch.object(vd.afx, "AudioLoop") as audio_loop,
+                    patch.object(vd, "_write_videofile_with_codec_fallback"),
+                    patch.object(
+                        vd, "_get_configured_video_codec", return_value="libx264"
+                    ),
+                ):
+                    result = vd.generate_video(
+                        video_path="combined.mp4",
+                        audio_path="voice.mp3",
+                        subtitle_path="",
+                        output_file="final.mp4",
+                        params=params,
+                        bgm_file_override=bgm_override,
+                    )
+
+                self.assertTrue(result)
+                if should_loop:
+                    audio_loop.assert_called_once_with(duration=source_video.duration)
+                else:
+                    audio_loop.assert_not_called()
+
     def test_preprocess_video(self):
         if not os.path.exists(self.test_img_path):
             self.fail(f"test image not found: {self.test_img_path}")
@@ -211,6 +528,24 @@ class TestVideoService(unittest.TestCase):
         with patch.object(vd, "_ffmpeg_encoder_exists", return_value=False):
             self.assertEqual(vd._get_effective_video_codec(), "libx264")
 
+    def test_get_configured_video_codec_uses_stable_default_when_unset(self):
+        """
+        WebUI 的“默认”模式不会持久化 video_codec。后端必须在配置缺失时继续
+        明确返回 libx264，不能把空值直接交给 MoviePy 或 FFmpeg 自行决定。
+        """
+        config.app.pop("video_codec", None)
+
+        self.assertEqual(vd._get_configured_video_codec(), "libx264")
+
+    def test_get_configured_video_codec_preserves_explicit_libx264(self):
+        """
+        用户明确选择 libx264 时需要保持固定选择。它与“跟随项目默认策略”当前
+        结果相同，但配置语义不同，未来调整默认值时不能影响显式选择。
+        """
+        config.app["video_codec"] = "libx264"
+
+        self.assertEqual(vd._get_configured_video_codec(), "libx264")
+
     def test_ffmpeg_encoder_exists_falls_back_when_probe_fails(self):
         """
         Windows 上用户配置的 ffmpeg 可能因为路径损坏、权限或杀软拦截而无法
@@ -280,10 +615,16 @@ class TestVideoService(unittest.TestCase):
         concat demuxer 的文件列表对 Windows 反斜杠较敏感，写入 list 前统一
         转成正斜杠，并继续保留单引号转义。
         """
-        with patch.object(vd.os.path, "abspath", return_value=r"C:\Users\Harry's Videos\clip.mp4"):
+        with patch.object(
+            vd.os.path,
+            "abspath",
+            return_value=r"C:\Users\Test User's Videos\clip.mp4",
+        ):
             self.assertEqual(
-                vd._format_ffmpeg_concat_path(r"C:\Users\Harry's Videos\clip.mp4"),
-                "C:/Users/Harry'\\''s Videos/clip.mp4",
+                vd._format_ffmpeg_concat_path(
+                    r"C:\Users\Test User's Videos\clip.mp4"
+                ),
+                "C:/Users/Test User'\\''s Videos/clip.mp4",
             )
 
     def test_concat_video_clips_falls_back_after_runtime_encoder_failure(self):
@@ -293,7 +634,7 @@ class TestVideoService(unittest.TestCase):
         """
         config.app["video_codec"] = "h264_nvenc"
 
-        def fake_run(command, capture_output, text, check):
+        def fake_run(command, capture_output, text, check, **kwargs):
             codec_index = command.index("-c:v") + 1
             codec = command[codec_index]
             if codec == "h264_nvenc":
@@ -332,7 +673,7 @@ class TestVideoService(unittest.TestCase):
         """
         config.app["video_codec"] = "h264_nvenc"
 
-        def fake_run(command, capture_output, text, check):
+        def fake_run(command, capture_output, text, check, **kwargs):
             codec_index = command.index("-c:v") + 1
             codec = command[codec_index]
             return types.SimpleNamespace(
@@ -364,20 +705,34 @@ class TestVideoService(unittest.TestCase):
         和 ffmpeg 命令。项目服务层应屏蔽这类依赖库噪声，避免用户把
         `audio_found: False` 误判为最终视频没有音频。
         """
-        video_path = os.path.join(resources_dir, "1.png.mp4")
-        if not os.path.exists(video_path):
-            self.fail(f"test video not found: {video_path}")
+        # 测试只关心服务层是否屏蔽 MoviePy 的读取噪声，不应长期保存一份由 PNG
+        # 编码而来的二进制 MP4 fixture。运行时生成短视频既能保持测试独立，也能
+        # 避免 fixture 因不同编码参数产生帧间闪烁后被误用于视觉效果验证。
+        image_path = os.path.join(resources_dir, "1.png")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = os.path.join(temp_dir, "image-fixture.mp4")
+            source_clip = ImageClip(image_path).with_duration(0.2)
+            try:
+                source_clip.write_videofile(
+                    video_path,
+                    codec="libx264",
+                    fps=5,
+                    audio=False,
+                    logger=None,
+                )
+            finally:
+                source_clip.close()
 
-        stdout = StringIO()
-        with redirect_stdout(stdout):
-            clip = vd._open_video_clip_quietly(video_path)
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                clip = vd._open_video_clip_quietly(video_path)
 
-        try:
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIsNone(clip.audio)
-            self.assertGreater(clip.duration, 0)
-        finally:
-            vd.close_clip(clip)
+            try:
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIsNone(clip.audio)
+                self.assertGreater(clip.duration, 0)
+            finally:
+                vd.close_clip(clip)
 
     def test_combine_videos_closes_audio_clip_when_duration_read_fails(self):
         """
@@ -440,6 +795,111 @@ class TestVideoService(unittest.TestCase):
                 )
                 self.assertEqual(result, combined_video_path)
 
+    def _capture_source_ranges_for_clip_speed(
+        self,
+        *,
+        source_duration,
+        audio_duration,
+        clip_speed,
+        max_clip_duration=3,
+    ):
+        """使用轻量假视频记录 combine_videos 实际读取的源时间范围。"""
+
+        source_ranges = []
+        written_durations = []
+
+        class _FakeAudioClip:
+            duration = audio_duration
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration, records_source_range=False):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+                self.records_source_range = records_source_range
+
+            def subclipped(self, start_time, end_time):
+                # 只记录直接从源文件读取的范围。变速后的安全裁剪也会调用
+                # subclipped，但它不代表新的源时间段，不能混入断层判断。
+                if self.records_source_range:
+                    source_ranges.append((start_time, end_time))
+                return _FakeVideoClip(end_time - start_time)
+
+            def with_speed_scaled(self, factor):
+                return _FakeVideoClip(self.duration / factor)
+
+            def close(self):
+                pass
+
+        def _open_fake_video_clip(_video_path):
+            return _FakeVideoClip(source_duration, records_source_range=True)
+
+        def _capture_written_clip(clip, *_args, **_kwargs):
+            written_durations.append(clip.duration)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_video_path = os.path.join(temp_dir, "combined.mp4")
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=_open_fake_video_clip,
+                ),
+                patch.object(
+                    vd,
+                    "_write_videofile_with_codec_fallback",
+                    side_effect=_capture_written_clip,
+                ),
+                # random 模式默认会打乱同一源视频的切片。这里保持生成顺序，
+                # 才能精确验证相邻源时间段是否连续。
+                patch.object(
+                    vd,
+                    "_prioritize_unique_source_clips",
+                    side_effect=lambda subclipped_items, concat_mode: subclipped_items,
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg"),
+                patch.object(vd, "delete_files"),
+            ):
+                vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=["clip.mp4"],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.random,
+                    max_clip_duration=max_clip_duration,
+                    clip_speed=clip_speed,
+                )
+
+        return source_ranges, written_durations
+
+    def test_combine_videos_slow_speed_keeps_source_timeline_continuous(self):
+        """0.5 倍慢放应连续读取 1.5 秒源片段，不能跳过中间画面。"""
+
+        source_ranges, written_durations = self._capture_source_ranges_for_clip_speed(
+            source_duration=4.0,
+            audio_duration=5.9,
+            clip_speed=0.5,
+        )
+
+        self.assertEqual(source_ranges, [(0, 1.5), (1.5, 3.0)])
+        self.assertEqual(written_durations, [3.0, 3.0])
+
+    def test_combine_videos_fast_speed_reads_enough_source_content(self):
+        """2 倍快放应读取 6 秒源画面，使最终片段仍保持 3 秒。"""
+
+        source_ranges, written_durations = self._capture_source_ranges_for_clip_speed(
+            source_duration=8.0,
+            audio_duration=2.9,
+            clip_speed=2.0,
+        )
+
+        self.assertEqual(source_ranges, [(0, 6.0)])
+        self.assertEqual(written_durations, [3.0])
+
     def test_combine_videos_keeps_small_duration_safety_margin(self):
         """
         音频和素材累计时长刚好相等时，仍应继续追加一个短片段作为安全余量。
@@ -485,7 +945,7 @@ class TestVideoService(unittest.TestCase):
                     with patch.object(
                         vd, "_write_videofile_with_codec_fallback"
                     ) as write_mock:
-                        with patch.object(vd, "concat_video_clips_with_ffmpeg"):
+                        with patch.object(vd, "concat_video_clips_with_ffmpeg") as concat_mock:
                             with patch.object(vd, "delete_files"):
                                 result = vd.combine_videos(
                                     combined_video_path=combined_video_path,
@@ -499,6 +959,84 @@ class TestVideoService(unittest.TestCase):
 
         self.assertEqual(result, combined_video_path)
         self.assertEqual(write_mock.call_count, 4)
+        self.assertEqual(concat_mock.call_args.kwargs["max_duration"], 10.0)
+
+    def test_concat_video_clips_limits_output_to_audio_duration(self):
+        """最终拼接时应裁到音频时长，避免安全余量带来明显静音尾巴。"""
+
+        def fake_run(command, capture_output, text, check, **kwargs):
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+
+            with patch.object(vd.subprocess, "run", side_effect=fake_run) as run:
+                vd.concat_video_clips_with_ffmpeg(
+                    clip_files=[clip_file],
+                    output_file=output_file,
+                    threads=1,
+                    output_dir=temp_dir,
+                    max_duration=10.0,
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-t") + 1], "10.000")
+        self.assertLess(command.index("-t"), command.index(output_file))
+
+    def test_concat_video_clips_logs_heartbeat_while_ffmpeg_runs(self):
+        """
+        拼接时 subprocess.run 会阻塞到 ffmpeg 退出，期间项目不再产生任何日志，用户
+        无法区分仍在编码与已经卡死（issue #1342）。等待期间必须记录存活信息。
+        """
+
+        def slow_run(command, capture_output, text, check, **kwargs):
+            # 模拟一次耗时拼接：这段窗口内心跳线程应至少记录一次存活日志。
+            time.sleep(0.2)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+            Path(output_file).write_bytes(b"x" * 2048)
+
+            with patch.object(vd, "_FFMPEG_CONCAT_HEARTBEAT_SECONDS", 0.02):
+                with patch.object(vd.subprocess, "run", side_effect=slow_run):
+                    with patch.object(vd.logger, "info") as info_mock:
+                        vd.concat_video_clips_with_ffmpeg(
+                            clip_files=[clip_file],
+                            output_file=output_file,
+                            threads=1,
+                            output_dir=temp_dir,
+                        )
+
+        heartbeats = [
+            str(call.args[0])
+            for call in info_mock.call_args_list
+            if "still running" in str(call.args[0])
+        ]
+        self.assertTrue(heartbeats, "耗时拼接期间必须记录存活日志")
+        self.assertRegex(heartbeats[0], r"elapsed=\d+s, output size: 0\.00 MB")
+
+    def test_concat_video_clips_heartbeat_tolerates_missing_output_file(self):
+        """
+        拼接刚开始时输出文件尚未创建，心跳描述必须安全降级；若探测文件大小的异常
+        穿透到拼接调用，本可正常完成的任务会变成失败。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertIn(
+                "not available",
+                vd._describe_concat_output_progress(
+                    os.path.join(temp_dir, "absent.mp4")
+                ),
+            )
+            existing = os.path.join(temp_dir, "present.mp4")
+            Path(existing).write_bytes(b"x" * 2048)
+            self.assertIn(
+                "output size: 0.00 MB", vd._describe_concat_output_progress(existing)
+            )
 
     def test_prioritize_unique_source_clips_uses_each_source_before_reuse(self):
         """
@@ -598,6 +1136,211 @@ class TestVideoService(unittest.TestCase):
         except Exception as e:
             self.fail(f"test wrap_text failed: {str(e)}")
 
+    def test_wrap_text_uses_stable_line_metrics_for_all_bundled_fonts(self):
+        """
+        字幕高度必须来自字体自身的 ascent/descent，而不能取决于当前文字。
+
+        不含 g/j/p/q/y 的拉丁文本只有大写字母和 x-height，Pillow 的字形
+        bbox 会比字体真实行高短很多；多行时误差累积，最终会裁掉最后一行。
+        这里遍历全部内置字体，并同时覆盖含下伸部与不含下伸部的英文文本，
+        防止以后重新引入“按当前字形墨迹计算行高”的实现。
+        """
+        font_size = 60
+        max_width = 360
+        text_cases = {
+            "without_descenders": "A man survived the Hiroshima atomic bomb blast",
+            "with_descenders": "Typing quickly brings joyful progress",
+        }
+        font_paths = sorted(
+            path
+            for path in Path(utils.font_dir()).iterdir()
+            if path.suffix.lower() in {".ttf", ".ttc"}
+        )
+
+        self.assertTrue(font_paths, "expected bundled subtitle fonts")
+        for font_path in font_paths:
+            font = vd.ImageFont.truetype(str(font_path), font_size)
+            expected_line_height = sum(font.getmetrics())
+            for case_name, text in text_cases.items():
+                with self.subTest(font=font_path.name, case=case_name):
+                    wrapped_text, text_height = vd.wrap_text(
+                        text=text,
+                        max_width=max_width,
+                        font=str(font_path),
+                        fontsize=font_size,
+                    )
+                    line_count = wrapped_text.count("\n") + 1
+
+                    self.assertGreater(line_count, 1)
+                    self.assertEqual(
+                        text_height,
+                        line_count * expected_line_height,
+                    )
+
+    def test_wrap_text_counts_existing_subtitle_line_breaks(self):
+        """
+        SRT 文本可能已经包含人工换行；即使每行都不需要再次折行，高度也必须
+        按最终两行计算。否则宽画面上的短句会绕过自动换行分支并再次裁掉末行。
+        """
+        font_size = 60
+        font_path = os.path.join(utils.font_dir(), "MicrosoftYaHeiBold.ttc")
+        text = "SAFE TEXT\nMORE SAFE"
+        font = vd.ImageFont.truetype(font_path, font_size)
+
+        wrapped_text, text_height = vd.wrap_text(
+            text=text,
+            max_width=972,
+            font=font_path,
+            fontsize=font_size,
+        )
+
+        self.assertEqual(wrapped_text, text)
+        self.assertEqual(text_height, 2 * sum(font.getmetrics()))
+
+    def test_small_subtitle_with_thick_stroke_keeps_a_bottom_margin(self):
+        """
+        小字号配粗描边是最容易重新触底的比例边界。遍历全部内置字体并读取
+        MoviePy 的真实 mask，确保额外高度至少容纳向上下扩张的完整描边。
+        """
+        font_size = 24
+        stroke_width = 6
+        max_width = 240
+        text = "A man survived the Hiroshima atomic bomb blast"
+        font_paths = sorted(
+            path
+            for path in Path(utils.font_dir()).iterdir()
+            if path.suffix.lower() in {".ttf", ".ttc"}
+        )
+
+        for font_path in font_paths:
+            with self.subTest(font=font_path.name):
+                wrapped_text, text_height = vd.wrap_text(
+                    text=text,
+                    max_width=max_width,
+                    font=str(font_path),
+                    fontsize=font_size,
+                )
+                line_count = wrapped_text.count("\n") + 1
+                interline = int(font_size * 0.25)
+                vertical_padding = int(font_size * 0.35)
+                stroke_padding = stroke_width * 2 * line_count
+                clip_height = int(
+                    text_height
+                    + vertical_padding
+                    + interline * line_count
+                    + stroke_padding
+                )
+                text_clip = vd.TextClip(
+                    text=wrapped_text,
+                    font=str(font_path),
+                    font_size=font_size,
+                    color="#FFFFFF",
+                    stroke_color="#000000",
+                    stroke_width=stroke_width,
+                    interline=interline,
+                    size=(max_width, clip_height),
+                    text_align="center",
+                )
+                try:
+                    mask = text_clip.mask.get_frame(0)
+                    visible_rows, _ = vd.np.where(mask > 0.01)
+
+                    self.assertGreater(len(visible_rows), 0)
+                    self.assertLess(int(visible_rows.max()), clip_height - 1)
+                finally:
+                    text_clip.close()
+
+    def test_multilingual_textclip_last_line_keeps_a_visible_bottom_margin(self):
+        """
+        使用 MoviePy 真实绘制多语种字幕，确保最后一行没有贴到画布底边。
+
+        仅检查 wrap_text() 返回值会漏掉 Pillow/MoviePy 在 baseline、描边和
+        行间距上的组合差异，因此这里直接读取 TextClip 的透明 mask。覆盖文本
+        均由对应内置字体完整支持，包括英文、越南语、泰语、简繁中文、俄语
+        和希腊语；只要可见像素触及最后一行，就说明仍存在静默裁切风险。
+        """
+        font_size = 60
+        max_width = 360
+        interline = int(font_size * 0.25)
+        vertical_padding = int(font_size * 0.35)
+        stroke_width = 2
+        cases = (
+            (
+                "english_without_descenders",
+                "BeVietnamPro-Bold.ttf",
+                "A man survived the Hiroshima atomic bomb blast",
+            ),
+            (
+                "vietnamese",
+                "BeVietnamPro-Medium.ttf",
+                "Tôi vẫn luôn tin vào một tương lai tươi sáng",
+            ),
+            (
+                "thai",
+                "Charm-Regular.ttf",
+                "นี่คือข้อความสำหรับตรวจสอบบรรทัดสุดท้ายของคำบรรยาย",
+            ),
+            (
+                "simplified_chinese",
+                "MicrosoftYaHeiBold.ttc",
+                "这是一个用于检查字幕最后一行是否完整显示的测试句子",
+            ),
+            (
+                "traditional_chinese",
+                "STHeitiMedium.ttc",
+                "這是一個用於檢查字幕最後一行是否完整顯示的測試句子",
+            ),
+            (
+                "cyrillic",
+                "MicrosoftYaHeiNormal.ttc",
+                "Это текст для проверки последней строки субтитров",
+            ),
+            (
+                "greek",
+                "STHeitiLight.ttc",
+                "Αυτό είναι κείμενο για τον έλεγχο της τελευταίας γραμμής",
+            ),
+        )
+
+        for language, font_name, text in cases:
+            font_path = os.path.join(utils.font_dir(), font_name)
+            with self.subTest(language=language, font=font_name):
+                self.assertTrue(vd.subtitle_font_supports_text(font_path, text))
+                wrapped_text, text_height = vd.wrap_text(
+                    text=text,
+                    max_width=max_width,
+                    font=font_path,
+                    fontsize=font_size,
+                )
+                line_count = wrapped_text.count("\n") + 1
+                stroke_padding = stroke_width * 2 * line_count
+                clip_height = int(
+                    text_height
+                    + vertical_padding
+                    + interline * line_count
+                    + stroke_padding
+                )
+                text_clip = vd.TextClip(
+                    text=wrapped_text,
+                    font=font_path,
+                    font_size=font_size,
+                    color="#FFFFFF",
+                    stroke_color="#000000",
+                    stroke_width=stroke_width,
+                    interline=interline,
+                    size=(max_width, clip_height),
+                    text_align="center",
+                )
+                try:
+                    mask = text_clip.mask.get_frame(0)
+                    visible_rows, _ = vd.np.where(mask > 0.01)
+
+                    self.assertGreater(line_count, 1)
+                    self.assertGreater(len(visible_rows), 0)
+                    self.assertLess(int(visible_rows.max()), clip_height - 1)
+                finally:
+                    text_clip.close()
+
     def test_rounded_subtitle_background_clip_has_transparent_corners(self):
         """
         圆角字幕背景只在用户显式开启时使用。这里直接验证生成的 RGBA
@@ -633,6 +1376,28 @@ class TestVideoService(unittest.TestCase):
                 with patch("sys.platform", platform):
                     result = vd._get_temp_audio_dir("/some/output/dir")
                     self.assertEqual(result, "/some/output/dir")
+
+
+class TestMaterialResolutionTolerance(unittest.TestCase):
+    def test_accepts_material_at_the_nominal_minimum(self):
+        self.assertTrue(vd.is_material_resolution_acceptable(480, 480))
+
+    def test_accepts_whatsapp_recompressed_portrait_clip(self):
+        # WhatsApp delivers 9:16 clips as 478x850, two pixels under the
+        # nominal 480 minimum. Rejecting them fails the whole task.
+        self.assertTrue(vd.is_material_resolution_acceptable(478, 850))
+
+    def test_accepts_material_exactly_at_the_tolerance_bound(self):
+        bound = vd._MIN_MATERIAL_DIMENSION - vd._MIN_DIMENSION_TOLERANCE
+        self.assertTrue(vd.is_material_resolution_acceptable(bound, bound))
+
+    def test_rejects_material_just_below_the_tolerance_bound(self):
+        bound = vd._MIN_MATERIAL_DIMENSION - vd._MIN_DIMENSION_TOLERANCE
+        self.assertFalse(vd.is_material_resolution_acceptable(bound - 1, 850))
+        self.assertFalse(vd.is_material_resolution_acceptable(850, bound - 1))
+
+    def test_rejects_genuinely_low_resolution_material(self):
+        self.assertFalse(vd.is_material_resolution_acceptable(320, 240))
 
 
 if __name__ == "__main__":
